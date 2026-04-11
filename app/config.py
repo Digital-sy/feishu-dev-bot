@@ -9,11 +9,14 @@ load_dotenv()
 class Config:
     feishu_app_id: str
     feishu_app_secret: str
-    bitable_app_token: str       # 成衣产研总控表 token（唯一一张多维表）
+    bitable_app_token: str
     table_sample_detail: str     # 开发版明细表-【产品版本池】
     table_dev_product: str       # 开发产品表-【产品立项】
     table_bulk_order: str        # 大货表-【生产执行】
-    claude_api_key: str
+    table_task: str              # 开款任务表（季节/品类选项的源头）
+    llm_api_key: str
+    llm_api_base: str
+    llm_model: str
     log_level: str
 
 
@@ -25,7 +28,7 @@ def load_config() -> Config:
         "TABLE_ID_SAMPLE_DETAIL",
         "TABLE_ID_DEV_PRODUCT",
         "TABLE_ID_BULK_ORDER",
-        "CLAUDE_API_KEY",
+        "TABLE_ID_TASK",
     }
     missing = [k for k in required if not os.getenv(k)]
     if missing:
@@ -38,7 +41,10 @@ def load_config() -> Config:
         table_sample_detail=os.environ["TABLE_ID_SAMPLE_DETAIL"],
         table_dev_product=os.environ["TABLE_ID_DEV_PRODUCT"],
         table_bulk_order=os.environ["TABLE_ID_BULK_ORDER"],
-        claude_api_key=os.environ["CLAUDE_API_KEY"],
+        table_task=os.environ["TABLE_ID_TASK"],
+        llm_api_key=os.getenv("LLM_API_KEY", ""),
+        llm_api_base=os.getenv("LLM_API_BASE", ""),
+        llm_model=os.getenv("LLM_MODEL", ""),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
     )
 

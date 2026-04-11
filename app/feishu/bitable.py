@@ -11,28 +11,17 @@ logger = logging.getLogger(__name__)
 
 EXCLUDE_PROGRESS = {"暂不下单，备用款", "订单取消"}
 
-PROGRESS_RANK = {
-    "开发版已批，待下订单": 1,
-    "产前版生产中":         2,
-    "报价中":               3,
-    "待运营确定价格":       4,
-    "已定价，待下单":       5,
-    "面料采购中":           6,
-    "生产中":               7,
-    "已出部分":             8,
-    "已出完":               9,
-    "暂不下单，备用款":     10,
-    "订单取消":             11,
-}
-
 PROGRESS_COLOR = {
     "开发版已批，待下订单": "blue",
     "产前版生产中":         "blue",
+    "产前版已回版":         "blue",
     "报价中":               "blue",
     "待运营确定价格":       "orange",
     "已定价，待下单":       "blue",
     "面料采购中":           "orange",
     "生产中":               "blue",
+    "生产已完成，待出货":   "blue",
+    "退厂返工中":           "orange",
     "已出部分":             "blue",
     "已出完":               "green",
     "暂不下单，备用款":     "gray",
@@ -40,67 +29,130 @@ PROGRESS_COLOR = {
 }
 
 
+# ──────────────────────────────────────────────
+# 选项映射缓存（用于回版状态、大货进度等真实选项字段）
+# ──────────────────────────────────────────────
+
+_opt_map: dict[str, str] = {}
+
+
+def init_option_map(app_token: str,
+                    table_dev: str,
+                    table_bulk: str,
+                    table_task: str) -> None:
+    """
+    启动时调用一次，拉取所有选项字段的映射。
+    - 回版状态：从开发产品表拉
+    - 大货进度、季节：从大货表拉
+    - 品类：从开款任务表拉（来源最完整，90个选项）
+    """
+    _load_options(app_token, table_dev,  ["回版状态"])
+    _load_options(app_token, table_bulk, ["季节"])
+    _load_options(app_token, table_task, ["品类"])
+    logger.info(f"选项映射加载完成，共 {len(_opt_map)} 个选项")
+
+
+def _load_options(app_token: str, table_id: str, field_names: list[str]) -> None:
+    url = f"{FEISHU_BASE}/bitable/v1/apps/{app_token}/tables/{table_id}/fields"
+    try:
+        resp = requests.get(url, headers=get_headers(), timeout=15)
+        resp.raise_for_status()
+        items = resp.json().get("data", {}).get("items", [])
+    except Exception as e:
+        logger.error(f"拉取字段元数据失败 table={table_id}: {e}")
+        return
+
+    for f in items:
+        if f["field_name"] not in field_names:
+            continue
+        prop = f.get("property", {})
+        # 普通选项字段：property.options
+        opts = prop.get("options", [])
+        # 公式选项字段：property.type.ui_property.options
+        if not opts:
+            opts = prop.get("type", {}).get("ui_property", {}).get("options", [])
+        for o in opts:
+            if o.get("id") and o.get("name"):
+                _opt_map[o["id"]] = o["name"]
+
+
+def _opt(opt_id: str) -> str:
+    return _opt_map.get(opt_id, "")
+
+
+# ──────────────────────────────────────────────
+# 季节工具
+# ──────────────────────────────────────────────
+
 def get_active_seasons() -> list[str]:
     """
     根据当前月份返回需要展示的季节列表。
-    格式：YY-春夏 / YY-秋冬
     1–6月  → 当年-春夏、当年-秋冬、次年-春夏
     7–12月 → 当年-秋冬、次年-春夏、次年-秋冬
     """
     today = date.today()
-    y = today.year % 100        # 取后两位，如 2026 → 26
+    y = today.year % 100
     y_next = (today.year + 1) % 100
-
     if today.month <= 6:
         return [f"{y}-春夏", f"{y}-秋冬", f"{y_next}-春夏"]
     else:
         return [f"{y}-秋冬", f"{y_next}-春夏", f"{y_next}-秋冬"]
 
 
+# ──────────────────────────────────────────────
+# 数据模型
+# ──────────────────────────────────────────────
+
 @dataclass
 class SampleRecord:
     """开发版明细表-【产品版本池】"""
-    auto_id: str               # 自动编号（内部唯一ID）
-    sample_no: str             # 记录编号（展示用，如 ZQZ402-初版）
-    supplier: str              # 打版工厂
-    developer: str             # 开发（人员字段）
-    product_type: str          # 品类
-    season: str                # 季节
-    send_date: Optional[date]  # 下版日期
-    return_date: Optional[date] # 回版日期
-    review_date: Optional[date] # 审版日期
-    notified: bool = False     # 回版通知是否已推送（去重用）
+    auto_id: str
+    sample_no: str
+    supplier: str
+    developer: str
+    developer_id: str
+    product_type: str
+    season: str
+    send_date: Optional[date]
+    return_date: Optional[date]
+    review_date: Optional[date]
+    notified: bool = False
 
 
 @dataclass
 class DevProductRecord:
     """开发产品表-【产品立项】"""
-    product_no: str                   # 款号
-    product_type: str                 # 品类
-    developer: str                    # 开发
-    season: str                       # 季节
-    has_sent_version: bool            # 下开发版（勾选框）
-    version_status: str               # 回版状态（公式字段）
-    # version_status 可能的值：
-    # 未下版单 / 已下版 / 已回版，审版中 / 已审版，待寄出 / 已定版 / 取消
+    product_no: str
+    product_type: str
+    developer: str
+    developer_id: str
+    season: str
+    has_sent_version: bool
+    version_status: str
 
 
 @dataclass
 class BulkOrderRecord:
     """大货表-【生产执行】"""
-    style_no: str                      # 款号
-    product_type: str                  # 品类
-    developer: str                     # 开发
-    season: str                        # 季节
-    progress_text: str                 # 大货进度（文字）
-    expected_delivery: Optional[date]  # 预计最后一批出货日期
-    actual_completion: Optional[date]  # 实际出完日期
-    supplier: str                      # 供应商
+    style_no: str
+    product_type: str
+    developer: str
+    developer_id: str
+    season: str
+    progress_text: str
+    expected_delivery: Optional[date]
+    actual_completion: Optional[date]
+    supplier: str
+    order_type: str              # 订单类型：首单 / 返单 / 空
 
     @property
     def is_excluded(self) -> bool:
-        """是否属于取消/备用状态，不进主列表"""
         return self.progress_text in EXCLUDE_PROGRESS
+
+    @property
+    def is_reorder(self) -> bool:
+        """是否为返单，返单不推送给开发"""
+        return self.order_type == "返单"
 
     @property
     def progress_color(self) -> str:
@@ -112,7 +164,6 @@ class BulkOrderRecord:
 # ──────────────────────────────────────────────
 
 def _fetch_all_records(app_token: str, table_id: str) -> list[dict]:
-    """翻页拉取子表全部记录，飞书单次最多 500 条。"""
     url = f"{FEISHU_BASE}/bitable/v1/apps/{app_token}/tables/{table_id}/records"
     records = []
     page_token = None
@@ -121,13 +172,12 @@ def _fetch_all_records(app_token: str, table_id: str) -> list[dict]:
         params = {"page_size": 500}
         if page_token:
             params["page_token"] = page_token
-
         try:
             resp = requests.get(url, headers=get_headers(), params=params, timeout=15)
             resp.raise_for_status()
             data = resp.json()
         except requests.RequestException as e:
-            logger.error(f"拉取多维表失败 app_token={app_token} table={table_id}: {e}")
+            logger.error(f"拉取多维表失败 table={table_id}: {e}")
             raise
 
         if data.get("code") != 0:
@@ -148,16 +198,13 @@ def _fetch_all_records(app_token: str, table_id: str) -> list[dict]:
 
 
 # ──────────────────────────────────────────────
-# 字段探查（首次接入用）
+# 字段探查
 # ──────────────────────────────────────────────
 
 def inspect_fields(app_token: str, table_id: str, sample_rows: int = 3) -> dict[str, Any]:
-    """拉取前 N 条原始记录，返回字段名、推断类型、样本值。"""
     url = f"{FEISHU_BASE}/bitable/v1/apps/{app_token}/tables/{table_id}/records"
-    resp = requests.get(
-        url, headers=get_headers(),
-        params={"page_size": sample_rows}, timeout=15,
-    )
+    resp = requests.get(url, headers=get_headers(),
+                        params={"page_size": sample_rows}, timeout=15)
     resp.raise_for_status()
     data = resp.json()
 
@@ -181,8 +228,18 @@ def inspect_fields(app_token: str, table_id: str, sample_rows: int = 3) -> dict[
         if not s:
             return "unknown"
         f = s[0]
+        if isinstance(f, dict) and "users" in f:
+            return "person(users{})"
         if isinstance(f, list) and f and isinstance(f[0], dict):
-            return "person" if "name" in f[0] else "text"
+            if "name" in f[0]:
+                return "person"
+            if "text" in f[0]:
+                return "text(rich)"
+            if "record_ids" in f[0]:
+                return "relation"
+        if isinstance(f, list) and f and isinstance(f[0], str):
+            if f[0].startswith("opt"):
+                return "option(opt_id)"
         if isinstance(f, int) and f > 1_000_000_000_000:
             return "date(timestamp_ms)"
         if isinstance(f, (int, float)):
@@ -204,12 +261,62 @@ def inspect_fields(app_token: str, table_id: str, sample_rows: int = 3) -> dict[
 # ──────────────────────────────────────────────
 
 def _str(fields: dict, key: str) -> str:
+    """普通文本字段"""
     val = fields.get(key)
     if val is None:
         return ""
-    if isinstance(val, list):
-        return "".join(item.get("text", "") for item in val if isinstance(item, dict))
+    if isinstance(val, list) and val and isinstance(val[0], dict):
+        return "".join(item.get("text", "") for item in val)
     return str(val)
+
+
+
+def _relation_text(fields: dict, key: str) -> str:
+    """
+    关联字段，取第一条关联记录的 text 值。
+    格式：[{"text": "ZQZ402", "record_ids": [...], "table_id": "..."}]
+    """
+    val = fields.get(key)
+    if not val or not isinstance(val, list):
+        return ""
+    first = val[0]
+    if isinstance(first, dict):
+        return first.get("text", "")
+    return ""
+
+def _option(fields: dict, key: str) -> str:
+    """单选字段，通过 opt_map 转成文字"""
+    val = fields.get(key)
+    if not val or not isinstance(val, list):
+        return ""
+    return _opt(val[0]) if val else ""
+
+
+def _task_season_category(fields: dict) -> tuple[str, str]:
+    """
+    从「开款任务」关联字段解析季节和品类。
+    文本格式：「季节-店铺-品线-品类」，如 26-秋冬-REORIA-基础款-连体衣
+    季节 = 第一段（YY-春夏 / YY-秋冬 / 历史-春夏 等）
+    品类 = 最后一段
+    """
+    val = fields.get("开款任务")
+    if not val or not isinstance(val, list):
+        return "", ""
+
+    text = val[0].get("text", "") if isinstance(val[0], dict) else ""
+    if not text:
+        return "", ""
+
+    parts = text.split("-")
+    if len(parts) < 2:
+        return text, ""
+
+    # 季节：前两段拼起来，如 "26" + "秋冬" → "26-秋冬"
+    season = f"{parts[0]}-{parts[1]}" if len(parts) >= 2 else parts[0]
+    # 品类：最后一段
+    category = parts[-1].strip() if parts[-1].strip() else ""
+
+    return season, category
 
 
 def _date(fields: dict, key: str) -> Optional[date]:
@@ -234,7 +341,6 @@ def _int(fields: dict, key: str, default: int = 0) -> int:
 
 
 def _bool(fields: dict, key: str) -> bool:
-    """勾选框字段：1 / True = 已勾选"""
     val = fields.get(key)
     if isinstance(val, bool):
         return val
@@ -243,31 +349,67 @@ def _bool(fields: dict, key: str) -> bool:
     return False
 
 
-def _person(fields: dict, key: str) -> str:
+def _person(fields: dict, key: str) -> tuple[str, str]:
+    """
+    人员字段，返回 (姓名, 飞书用户ID)。
+    兼容两种结构：
+      {"users": [{"name": "张三", "id": "ou_xxx"}]}   开发版明细表
+      [{"name": "张三", "id": "ou_xxx"}]              开发产品表/大货表
+    """
     val = fields.get(key)
-    if not val or not isinstance(val, list):
-        return ""
-    return "、".join(p.get("name", "") for p in val if isinstance(p, dict))
+    if not val:
+        return "", ""
+
+    if isinstance(val, dict) and "users" in val:
+        users = val["users"]
+    elif isinstance(val, list) and val and isinstance(val[0], dict):
+        users = val
+    else:
+        return "", ""
+
+    if not users:
+        return "", ""
+
+    first = users[0]
+    name = first.get("name") or first.get("enName", "")
+    uid = first.get("id", "")
+    return name, uid
 
 
 # ──────────────────────────────────────────────
 # 三张表读取
 # ──────────────────────────────────────────────
 
-def fetch_sample_records(app_token: str, table_id: str) -> list[SampleRecord]:
-    """读取「开发版明细表-【产品版本池】」"""
+def fetch_sample_records(
+    app_token: str,
+    table_id: str,
+    dev_product_map: dict[str, tuple[str, str]] | None = None,
+) -> list[SampleRecord]:
+    """
+    读取「开发版明细表-【产品版本池】」。
+    dev_product_map: 款号 → (season, product_type) 的映射，
+                     由外部传入（从开发产品表预先构建），用于补全季节和品类。
+    """
     raw = _fetch_all_records(app_token, table_id)
     results = []
     for item in raw:
         f = item.get("fields", {})
         try:
+            name, uid = _person(f, "开发")
+            # 从款号关联字段里取款号文字
+            style_no = _relation_text(f, "款号")
+            # 通过款号从开发产品表映射里拿季节和品类
+            season, category = ("", "")
+            if dev_product_map and style_no:
+                season, category = dev_product_map.get(style_no, ("", ""))
             results.append(SampleRecord(
                 auto_id=str(_int(f, "自动编号")),
                 sample_no=_str(f, "记录编号"),
                 supplier=_str(f, "打版工厂"),
-                developer=_person(f, "开发"),
-                product_type=_str(f, "品类"),
-                season=_str(f, "季节"),
+                developer=name,
+                developer_id=uid,
+                product_type=category,
+                season=season,
                 send_date=_date(f, "下版日期"),
                 return_date=_date(f, "回版日期"),
                 review_date=_date(f, "审版日期"),
@@ -277,6 +419,18 @@ def fetch_sample_records(app_token: str, table_id: str) -> list[SampleRecord]:
     return results
 
 
+def build_dev_product_map(records: list) -> dict[str, tuple[str, str]]:
+    """
+    从开发产品表记录构建 款号 → (season, product_type) 的映射。
+    供 fetch_sample_records 使用。
+    """
+    return {
+        r.product_no: (r.season, r.product_type)
+        for r in records
+        if r.product_no
+    }
+
+
 def fetch_dev_product_records(app_token: str, table_id: str) -> list[DevProductRecord]:
     """读取「开发产品表-【产品立项】」"""
     raw = _fetch_all_records(app_token, table_id)
@@ -284,13 +438,16 @@ def fetch_dev_product_records(app_token: str, table_id: str) -> list[DevProductR
     for item in raw:
         f = item.get("fields", {})
         try:
+            name, uid = _person(f, "开发")
+            season, category = _task_season_category(f)
             results.append(DevProductRecord(
                 product_no=_str(f, "款号"),
-                product_type=_str(f, "品类"),
-                developer=_person(f, "开发"),
-                season=_str(f, "季节"),
+                product_type=category,
+                developer=name,
+                developer_id=uid,
+                season=season,
                 has_sent_version=_bool(f, "下开发版"),
-                version_status=_str(f, "回版状态"),
+                version_status=_option(f, "回版状态"),
             ))
         except Exception as e:
             logger.warning(f"跳过异常记录 record_id={item.get('record_id')}: {e}")
@@ -304,15 +461,18 @@ def fetch_bulk_order_records(app_token: str, table_id: str) -> list[BulkOrderRec
     for item in raw:
         f = item.get("fields", {})
         try:
+            name, uid = _person(f, "开发")
             results.append(BulkOrderRecord(
                 style_no=_str(f, "款号"),
-                product_type=_str(f, "品类"),
-                developer=_person(f, "开发"),
-                season=_str(f, "季节"),
+                product_type=_option(f, "品类"),
+                developer=name,
+                developer_id=uid,
+                season=_option(f, "季节"),
                 progress_text=_str(f, "大货进度"),
                 expected_delivery=_date(f, "预计最后一批出货日期"),
                 actual_completion=_date(f, "实际出完日期"),
                 supplier=_str(f, "供应商"),
+                order_type=_str(f, "订单类型"),
             ))
         except Exception as e:
             logger.warning(f"跳过异常记录 record_id={item.get('record_id')}: {e}")
@@ -320,50 +480,37 @@ def fetch_bulk_order_records(app_token: str, table_id: str) -> list[BulkOrderRec
 
 
 # ──────────────────────────────────────────────
-# 季节过滤（早报调用）
+# 季节过滤
 # ──────────────────────────────────────────────
 
 def filter_active_seasons(
     records: list[BulkOrderRecord],
 ) -> tuple[list[BulkOrderRecord], list[BulkOrderRecord]]:
     """
-    按季节过滤大货记录，返回 (主列表, 取消/备用列表)。
-
-    主列表：当前活跃季节内、非取消/备用状态的记录。
-    取消/备用列表：进度为「暂不下单，备用款」或「订单取消」的记录。
-
-    季节是否"已结束"的判断：
-      该季节内所有有效记录（排除取消/备用）的实际出完日期都有值，
-      且最晚出完日距今 > 5 天，则认为该季节已结束，移出主列表。
+    返回 (主列表, 取消/备用列表)。
+    季节结束条件：该季节所有有效记录的实际出完日期都有值，且最晚出完日距今 > 5 天。
     """
     today = date.today()
     active_seasons = get_active_seasons()
 
-    # 先按季节分桶
     season_records: dict[str, list[BulkOrderRecord]] = {}
     for r in records:
         season_records.setdefault(r.season, []).append(r)
 
-    # 判断哪些活跃季节实际上已经结束
     finished_seasons = set()
     for season in active_seasons:
-        season_valid = [
-            r for r in season_records.get(season, [])
-            if not r.is_excluded
-        ]
-        if not season_valid:
+        valid = [r for r in season_records.get(season, []) if not r.is_excluded]
+        if not valid:
             continue
-        all_completed = all(r.actual_completion for r in season_valid)
-        if all_completed:
-            latest = max(r.actual_completion for r in season_valid)
+        if all(r.actual_completion for r in valid):
+            latest = max(r.actual_completion for r in valid)
             if (today - latest).days > 5:
                 finished_seasons.add(season)
 
     real_active = [s for s in active_seasons if s not in finished_seasons]
-
     main_list = [
         r for r in records
-        if r.season in real_active and not r.is_excluded
+        if r.season in real_active and not r.is_excluded and not r.is_reorder
     ]
     excluded_list = [
         r for r in records
