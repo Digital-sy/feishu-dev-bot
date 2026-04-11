@@ -17,7 +17,7 @@ from app.feishu.bitable import (
 TABLES = [
     {
         "label":     "开发版明细表-【产品版本池】",
-        "app_token": config.bitable_token_garment,
+        "app_token": config.bitable_app_token,
         "table_id":  config.table_sample_detail,
         "expected_fields": {
             "自动编号": "auto_id",
@@ -33,7 +33,7 @@ TABLES = [
     },
     {
         "label":     "开发产品表-【产品立项】",
-        "app_token": config.bitable_token_garment,
+        "app_token": config.bitable_app_token,
         "table_id":  config.table_dev_product,
         "expected_fields": {
             "款号":     "product_no",
@@ -46,7 +46,7 @@ TABLES = [
     },
     {
         "label":     "大货表-【生产执行】",
-        "app_token": config.bitable_token_production,
+        "app_token": config.bitable_app_token,
         "table_id":  config.table_bulk_order,
         "expected_fields": {
             "款号":             "style_no",
@@ -148,7 +148,7 @@ def cmd_verify():
     # ── 开发版明细 ──────────────────────────────
     try:
         samples = fetch_sample_records(
-            config.bitable_token_garment, config.table_sample_detail
+            config.bitable_app_token, config.table_sample_detail
         )
         def sample_extra(records):
             no_dev   = [r for r in records if not r.developer]
@@ -173,7 +173,7 @@ def cmd_verify():
     # ── 开发产品表 ──────────────────────────────
     try:
         devp = fetch_dev_product_records(
-            config.bitable_token_garment, config.table_dev_product
+            config.bitable_app_token, config.table_dev_product
         )
         def dev_extra(records):
             in_season = [r for r in records if r.season in active]
@@ -200,7 +200,7 @@ def cmd_verify():
     # ── 大货表 ──────────────────────────────────
     try:
         bulk = fetch_bulk_order_records(
-            config.bitable_token_production, config.table_bulk_order
+            config.bitable_app_token, config.table_bulk_order
         )
         def bulk_extra(records):
             main_list, excluded = filter_active_seasons(records)
