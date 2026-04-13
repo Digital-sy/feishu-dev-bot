@@ -285,6 +285,163 @@ def build_card(
     }
 
 
+def build_summary_card(all_data: list[dict]) -> dict:
+    """
+    构建汇总卡片。
+    分组逻辑：先按状态/进度分组，组内再按人员列出。
+    """
+    today_str = date.today().strftime("%Y-%m-%d")
+    elements = []
+
+    # ── 板块1：待下版单（按状态分组） ──
+    elements.append({"tag": "markdown", "content": "**📋 板块 1 · 待下版单汇总**"})
+
+    # 收集各状态下的款，按状态分桶
+    status_buckets: dict[str, list[list[str]]] = {
+        "待下版":   [],
+        "跳过打版": [],
+        "预备款":   [],
+    }
+    for d in all_data:
+        for r in d["pending"]:
+            status_buckets["待下版"].append([d["developer"], r["product_no"], r["product_type"], r["season"]])
+        for r in d["no_info"]:
+            status_buckets["跳过打版"].append([d["developer"], r["product_no"], r["product_type"], r["season"]])
+        for r in d["reserve"]:
+            status_buckets["预备款"].append([d["developer"], r["product_no"], r["product_type"], r["season"]])
+
+    has_version_data = any(status_buckets.values())
+    if has_version_data:
+        for status_label, rows in status_buckets.items():
+            if not rows:
+                continue
+            elements.append({"tag": "markdown", "content": f"**{status_label}（{len(rows)}款）：**"})
+            # 按人员排序
+            rows.sort(key=lambda x: x[0])
+            elements.append(_table([["开发", "款号", "品类", "季节"]] + rows))
+    else:
+        elements.append({"tag": "markdown", "content": "当前无待下版单产品 ✅"})
+
+    elements.append({"tag": "hr"})
+
+    # ── 板块2：回版预报（按回版日期排序） ──
+    elements.append({"tag": "markdown", "content": "**📅 板块 2 · 开发版回版预报汇总（未来三日）**"})
+
+    forecast_rows = []
+    for d in all_data:
+        for r in d["forecast"]:
+            forecast_rows.append([
+                r["return_date"], d["developer"], r["sample_no"],
+                r["supplier"], r["review_date"],
+            ])
+
+    if forecast_rows:
+        forecast_rows.sort(key=lambda x: x[0])
+        elements.append(_table(
+            [["回版日期", "开发", "版本编号", "工厂", "审版截止"]] + forecast_rows
+        ))
+    else:
+        elements.append({"tag": "markdown", "content": "未来三日暂无回版计划"})
+
+    elements.append({"tag": "hr"})
+
+    # ── 板块3：大货生产（按进度状态分组，组内按人员） ──
+    elements.append({"tag": "markdown", "content": "**🏭 板块 3 · 大货生产汇总**"})
+
+    # 告急
+    urgent_rows = []
+    for d in all_data:
+        for r in d["bulk_urgent"]:
+            urgent_rows.append([
+                d["developer"], r["style_no"], r["product_type"],
+                r["progress_text"], f"{r['order_qty']}件",
+                f"{r['expected_delivery']}(还剩{r['days_left']}天)",
+                r["factory_delivery"],
+            ])
+
+    if urgent_rows:
+        urgent_rows.sort(key=lambda x: x[0])
+        elements.append({"tag": "markdown", "content": f"**⚠️ 交期告急（≤7天）（{len(urgent_rows)}款）：**"})
+        elements.append(_table(
+            [["开发", "款号", "品类", "进度", "下单量", "预计交期", "工厂货期"]] + urgent_rows
+        ))
+
+    # 进行中：按进度状态分桶
+    from collections import defaultdict
+    progress_buckets: dict[str, list[list[str]]] = defaultdict(list)
+    for d in all_data:
+        for r in d["bulk_in_progress"]:
+            days_str = f"还剩{r['days_left']}天" if r["days_left"] is not None else "—"
+            progress_buckets[r["progress_text"]].append([
+                d["developer"], r["style_no"], r["product_type"],
+                f"{r['order_qty']}件",
+                f"{r['expected_delivery']}({days_str})",
+                r["factory_delivery"],
+            ])
+
+    # 按预设顺序展示进度状态
+    PROGRESS_ORDER = [
+        "产前版生产中", "产前版已回版", "报价中", "待运营确定价格",
+        "已定价，待下单", "面料采购中", "生产中", "生产已完成，待出货",
+        "退厂返工中", "已出部分", "开发版已批，待下订单",
+    ]
+    shown_any_progress = False
+    for prog in PROGRESS_ORDER:
+        rows = progress_buckets.get(prog, [])
+        if not rows:
+            continue
+        rows.sort(key=lambda x: x[0])
+        elements.append({"tag": "markdown", "content": f"**{prog}（{len(rows)}款）：**"})
+        elements.append(_table(
+            [["开发", "款号", "品类", "下单量", "预计交期", "工厂货期"]] + rows
+        ))
+        shown_any_progress = True
+
+    # 其他未在预设列表里的进度
+    for prog, rows in progress_buckets.items():
+        if prog in PROGRESS_ORDER or not rows:
+            continue
+        rows.sort(key=lambda x: x[0])
+        elements.append({"tag": "markdown", "content": f"**{prog}（{len(rows)}款）：**"})
+        elements.append(_table(
+            [["开发", "款号", "品类", "下单量", "预计交期", "工厂货期"]] + rows
+        ))
+        shown_any_progress = True
+
+    if not urgent_rows and not shown_any_progress:
+        elements.append({"tag": "markdown", "content": "当前无进行中的大货订单"})
+
+    total_pending = sum(len(d["pending"]) for d in all_data)
+    total_forecast = sum(len(d["forecast"]) for d in all_data)
+    total_urgent = len(urgent_rows)
+
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {
+                "tag": "plain_text",
+                "content": f"开发工作助手 · 统筹早报  {today_str}",
+            },
+            "template": "indigo",
+        },
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": (
+                        f"今日共 **{total_pending}** 款待下版、"
+                        f"**{total_forecast}** 款预计回版、"
+                        f"**{total_urgent}** 款大货告急。"
+                    ),
+                },
+                {"tag": "hr"},
+                *elements,
+            ]
+        },
+    }
+
+
 def run_daily_report():
     logger.info("早报生成开始")
 
@@ -316,12 +473,35 @@ def run_daily_report():
 
     logger.info(f"共识别到 {len(developers)} 位开发人员")
 
+    # 统筹汇总数据
+    summary_data = []
+
     for dev_name, dev_id in developers.items():
         try:
             forecast = get_return_forecast(samples, dev_name)
             pending, no_info, reserve, cancelled = get_pending_versions(dev_products, dev_name)
             bulk_progress, bulk_urgent = get_bulk_progress(bulk_raw, dev_name)
 
+            # 进行中（非告急、非已出完）
+            urgent_style_nos = {r["style_no"] for r in bulk_urgent}
+            bulk_in_progress = [
+                r for r in bulk_progress
+                if not r["is_completed"] and r["style_no"] not in urgent_style_nos
+            ]
+
+            # 加入统筹汇总
+            if forecast or pending or no_info or reserve or bulk_progress:
+                summary_data.append({
+                    "developer":       dev_name,
+                    "forecast":        forecast,
+                    "pending":         pending,
+                    "no_info":         no_info,
+                    "reserve":         reserve,
+                    "bulk_urgent":     bulk_urgent,
+                    "bulk_in_progress": bulk_in_progress,
+                })
+
+            # 个人早报
             if not forecast and not pending and not no_info and not reserve and not bulk_progress:
                 logger.info(f"{dev_name}：无需推送，跳过")
                 continue
@@ -342,5 +522,17 @@ def run_daily_report():
 
         except Exception as e:
             logger.error(f"{dev_name}：早报推送失败 - {e}")
+
+    # 发送统筹汇总
+    summary_id = os.getenv("SUMMARY_RECEIVER_ID", "")
+    if summary_data and summary_id:
+        try:
+            summary_card = build_summary_card(summary_data)
+            send_card(user_id=summary_id, card=summary_card)
+            logger.info("统筹早报推送成功")
+        except Exception as e:
+            logger.error(f"统筹早报推送失败 - {e}")
+    elif not summary_id:
+        logger.warning("未配置 SUMMARY_RECEIVER_ID，跳过统筹推送")
 
     logger.info("早报生成完成")

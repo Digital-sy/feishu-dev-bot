@@ -19,6 +19,7 @@ class Config:
     llm_model: str
     log_level: str
     excluded_seasons: list[str]  # 手动剔除的季节，逗号分隔
+    summary_receiver_id: str     # 统筹汇总接收人 open_id
 
 
 def load_config() -> Config:
@@ -51,6 +52,7 @@ def load_config() -> Config:
             s.strip() for s in os.getenv("EXCLUDED_SEASONS", "").split(",")
             if s.strip()
         ],
+        summary_receiver_id=os.getenv("SUMMARY_RECEIVER_ID", ""),
     )
 
 
