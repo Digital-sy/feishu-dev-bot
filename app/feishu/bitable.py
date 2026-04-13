@@ -86,17 +86,26 @@ def _opt(opt_id: str) -> str:
 
 def get_active_seasons() -> list[str]:
     """
-    根据当前月份返回需要展示的季节列表。
+    根据当前月份返回需要展示的季节列表，同时排除手动剔除的季节。
     1–6月  → 当年-春夏、当年-秋冬、次年-春夏
     7–12月 → 当年-秋冬、次年-春夏、次年-秋冬
+    手动剔除：通过 .env 的 EXCLUDED_SEASONS 配置
     """
+    from app.config import config
     today = date.today()
     y = today.year % 100
     y_next = (today.year + 1) % 100
     if today.month <= 6:
-        return [f"{y}-春夏", f"{y}-秋冬", f"{y_next}-春夏"]
+        seasons = [f"{y}-春夏", f"{y}-秋冬", f"{y_next}-春夏"]
     else:
-        return [f"{y}-秋冬", f"{y_next}-春夏", f"{y_next}-秋冬"]
+        seasons = [f"{y}-秋冬", f"{y_next}-春夏", f"{y_next}-秋冬"]
+
+    excluded = config.excluded_seasons
+    if excluded:
+        seasons = [s for s in seasons if s not in excluded]
+        logger.info(f"已剔除季节：{excluded}，当前活跃：{seasons}")
+
+    return seasons
 
 
 # ──────────────────────────────────────────────

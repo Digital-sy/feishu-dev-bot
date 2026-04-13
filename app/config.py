@@ -18,6 +18,7 @@ class Config:
     llm_api_base: str
     llm_model: str
     log_level: str
+    excluded_seasons: list[str]  # 手动剔除的季节，逗号分隔
 
 
 def load_config() -> Config:
@@ -46,6 +47,10 @@ def load_config() -> Config:
         llm_api_base=os.getenv("LLM_API_BASE", ""),
         llm_model=os.getenv("LLM_MODEL", ""),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
+        excluded_seasons=[
+            s.strip() for s in os.getenv("EXCLUDED_SEASONS", "").split(",")
+            if s.strip()
+        ],
     )
 
 
