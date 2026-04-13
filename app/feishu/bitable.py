@@ -129,6 +129,7 @@ class DevProductRecord:
     season: str
     has_sent_version: bool
     version_status: str
+    launch_batch: str            # 上架批次：首发款 / 预备款 / 空
 
 
 @dataclass
@@ -144,6 +145,9 @@ class BulkOrderRecord:
     actual_completion: Optional[date]
     supplier: str
     order_type: str              # 订单类型：首单 / 返单 / 空
+    material_progress: str       # 面/辅料进度
+    order_qty: str               # 下单数量
+    factory_delivery: Optional[date]  # 工厂回复货期
 
     @property
     def is_excluded(self) -> bool:
@@ -448,6 +452,7 @@ def fetch_dev_product_records(app_token: str, table_id: str) -> list[DevProductR
                 season=season,
                 has_sent_version=_bool(f, "下开发版"),
                 version_status=_option(f, "回版状态"),
+                launch_batch=_str(f, "上架批次"),
             ))
         except Exception as e:
             logger.warning(f"跳过异常记录 record_id={item.get('record_id')}: {e}")
@@ -473,6 +478,9 @@ def fetch_bulk_order_records(app_token: str, table_id: str) -> list[BulkOrderRec
                 actual_completion=_date(f, "实际出完日期"),
                 supplier=_str(f, "供应商"),
                 order_type=_str(f, "订单类型"),
+                material_progress=_str(f, "面/辅料进度"),
+                order_qty=_str(f, "下单数量"),
+                factory_delivery=_date(f, "工厂回复货期"),
             ))
         except Exception as e:
             logger.warning(f"跳过异常记录 record_id={item.get('record_id')}: {e}")
