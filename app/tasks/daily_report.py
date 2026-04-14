@@ -1,4 +1,5 @@
 import logging
+import os
 from datetime import date, timedelta
 
 from app.config import config
@@ -15,11 +16,18 @@ from app.feishu.message import send_card
 logger = logging.getLogger(__name__)
 
 
-def get_return_forecast(samples: list, developer: str) -> list[dict]:
+def get_return_forecast(samples: list, developer: str, cycle_map: dict | None = None) -> list[dict]:
+    """
+    回版预报（B逻辑）：
+    - 已确认：回版日期有值，且在今日~T+3内
+    - AI预估：已下版、未回版，用历史均值推算预计回版日，若预计日在今日~T+3内则纳入
+    """
+    from app.utils.cycle_calc import estimate_return_date
     today = date.today()
     deadline = today + timedelta(days=3)
     active_seasons = get_active_seasons()
     result = []
+
     for r in samples:
         if r.developer != developer:
             continue
@@ -27,15 +35,36 @@ def get_return_forecast(samples: list, developer: str) -> list[dict]:
             continue
         if not r.send_date:
             continue
-        if r.return_date and today <= r.return_date <= deadline:
-            result.append({
-                "sample_no":   r.sample_no,
-                "supplier":    r.supplier,
-                "return_date": r.return_date.strftime("%m月%d日"),
-                "review_date": r.review_date.strftime("%m月%d日") if r.review_date else "—",
-                "source":      "已确认",
-            })
-    return sorted(result, key=lambda x: x["return_date"])
+
+        if r.return_date:
+            # 已确认回版
+            if today <= r.return_date <= deadline:
+                result.append({
+                    "sample_no":   r.sample_no,
+                    "supplier":    r.supplier,
+                    "return_date": r.return_date.strftime("%m月%d日"),
+                    "review_date": r.review_date.strftime("%m月%d日") if r.review_date else "—",
+                    "source":      "已确认",
+                    "source_type": "confirmed",
+                    "sort_date":   r.return_date,
+                })
+        elif cycle_map:
+            # AI 预估：已下版但未回版
+            est_date, source = estimate_return_date(
+                r.supplier, r.product_type, r.send_date, cycle_map
+            )
+            if today <= est_date <= deadline:
+                result.append({
+                    "sample_no":   r.sample_no,
+                    "supplier":    r.supplier,
+                    "return_date": est_date.strftime("%m月%d日"),
+                    "review_date": "—",
+                    "source":      f"AI预估·{source}",
+                    "source_type": "estimated",
+                    "sort_date":   est_date,
+                })
+
+    return sorted(result, key=lambda x: x["sort_date"])
 
 
 def get_pending_versions(dev_products: list, developer: str) -> tuple[list, list, list, list]:
@@ -195,8 +224,9 @@ def build_card(
 
     if forecast:
         elements.append(_table(
-            [["版本编号", "工厂", "回版日期", "审版截止", "来源"]] +
-            [[r["sample_no"], r["supplier"], r["return_date"], r["review_date"], r["source"]]
+            [["版本编号", "工厂", "回版日期", "来源"]] +
+            [[r["sample_no"], r["supplier"], r["return_date"],
+              r["source"].replace("AI预估·", "预估·")]
              for r in forecast]
         ))
     else:
@@ -287,133 +317,85 @@ def build_card(
 
 def build_summary_card(all_data: list[dict]) -> dict:
     """
-    构建汇总卡片。
-    分组逻辑：先按状态/进度分组，组内再按人员列出。
+    构建汇总卡片。每个板块只用一个 table，避免超出飞书 table 数量限制。
+    板块1：待下版单，状态列区分
+    板块2：回版预报，按日期排序
+    板块3：大货进行中（含告急），已出完单独一行
     """
     today_str = date.today().strftime("%Y-%m-%d")
     elements = []
 
-    # ── 板块1：待下版单（按状态分组） ──
+    # ── 板块1：待下版单（一个 table，状态列区分） ──
     elements.append({"tag": "markdown", "content": "**📋 板块 1 · 待下版单汇总**"})
-
-    # 收集各状态下的款，按状态分桶
-    status_buckets: dict[str, list[list[str]]] = {
-        "待下版":   [],
-        "跳过打版": [],
-        "预备款":   [],
-    }
+    version_rows = []
     for d in all_data:
         for r in d["pending"]:
-            status_buckets["待下版"].append([d["developer"], r["product_no"], r["product_type"], r["season"]])
+            version_rows.append([d["developer"], r["product_no"], r["product_type"], r["season"], "待下版"])
         for r in d["no_info"]:
-            status_buckets["跳过打版"].append([d["developer"], r["product_no"], r["product_type"], r["season"]])
+            version_rows.append([d["developer"], r["product_no"], r["product_type"], r["season"], "跳过打版"])
         for r in d["reserve"]:
-            status_buckets["预备款"].append([d["developer"], r["product_no"], r["product_type"], r["season"]])
+            version_rows.append([d["developer"], r["product_no"], r["product_type"], r["season"], "预备款"])
 
-    has_version_data = any(status_buckets.values())
-    if has_version_data:
-        for status_label, rows in status_buckets.items():
-            if not rows:
-                continue
-            elements.append({"tag": "markdown", "content": f"**{status_label}（{len(rows)}款）：**"})
-            # 按人员排序
-            rows.sort(key=lambda x: x[0])
-            elements.append(_table([["开发", "款号", "品类", "季节"]] + rows))
+    if version_rows:
+        version_rows.sort(key=lambda x: (x[4], x[0]))
+        elements.append(_table([["开发", "款号", "品类", "季节", "状态"]] + version_rows))
     else:
         elements.append({"tag": "markdown", "content": "当前无待下版单产品 ✅"})
 
     elements.append({"tag": "hr"})
 
-    # ── 板块2：回版预报（按回版日期排序） ──
+    # ── 板块2：回版预报（一个 table，按日期排序） ──
     elements.append({"tag": "markdown", "content": "**📅 板块 2 · 开发版回版预报汇总（未来三日）**"})
-
     forecast_rows = []
     for d in all_data:
         for r in d["forecast"]:
             forecast_rows.append([
                 r["return_date"], d["developer"], r["sample_no"],
-                r["supplier"], r["review_date"],
+                r["supplier"], r["source"].replace("AI预估·", "预估·"),
             ])
-
     if forecast_rows:
         forecast_rows.sort(key=lambda x: x[0])
-        elements.append(_table(
-            [["回版日期", "开发", "版本编号", "工厂", "审版截止"]] + forecast_rows
-        ))
+        elements.append(_table([["回版日期", "开发", "版本编号", "工厂", "来源"]] + forecast_rows))
     else:
         elements.append({"tag": "markdown", "content": "未来三日暂无回版计划"})
 
     elements.append({"tag": "hr"})
 
-    # ── 板块3：大货生产（按进度状态分组，组内按人员） ──
+    # ── 板块3：大货生产（进行中一个 table，已出完一个 table，共两个） ──
     elements.append({"tag": "markdown", "content": "**🏭 板块 3 · 大货生产汇总**"})
 
-    # 告急
-    urgent_rows = []
+    active_rows = []   # 告急 + 进行中合并
     for d in all_data:
         for r in d["bulk_urgent"]:
-            urgent_rows.append([
+            active_rows.append([
                 d["developer"], r["style_no"], r["product_type"],
-                r["progress_text"], f"{r['order_qty']}件",
+                f"⚠️{r['progress_text']}",
+                f"{r['order_qty']}件",
                 f"{r['expected_delivery']}(还剩{r['days_left']}天)",
                 r["factory_delivery"],
             ])
-
-    if urgent_rows:
-        urgent_rows.sort(key=lambda x: x[0])
-        elements.append({"tag": "markdown", "content": f"**⚠️ 交期告急（≤7天）（{len(urgent_rows)}款）：**"})
-        elements.append(_table(
-            [["开发", "款号", "品类", "进度", "下单量", "预计交期", "工厂货期"]] + urgent_rows
-        ))
-
-    # 进行中：按进度状态分桶
-    from collections import defaultdict
-    progress_buckets: dict[str, list[list[str]]] = defaultdict(list)
-    for d in all_data:
         for r in d["bulk_in_progress"]:
             days_str = f"还剩{r['days_left']}天" if r["days_left"] is not None else "—"
-            progress_buckets[r["progress_text"]].append([
+            active_rows.append([
                 d["developer"], r["style_no"], r["product_type"],
+                r["progress_text"],
                 f"{r['order_qty']}件",
                 f"{r['expected_delivery']}({days_str})",
                 r["factory_delivery"],
             ])
 
-    # 按预设顺序展示进度状态
-    PROGRESS_ORDER = [
-        "产前版生产中", "产前版已回版", "报价中", "待运营确定价格",
-        "已定价，待下单", "面料采购中", "生产中", "生产已完成，待出货",
-        "退厂返工中", "已出部分", "开发版已批，待下订单",
-    ]
-    shown_any_progress = False
-    for prog in PROGRESS_ORDER:
-        rows = progress_buckets.get(prog, [])
-        if not rows:
-            continue
-        rows.sort(key=lambda x: x[0])
-        elements.append({"tag": "markdown", "content": f"**{prog}（{len(rows)}款）：**"})
+    if active_rows:
+        active_rows.sort(key=lambda x: (x[0], x[3]))
+        elements.append({"tag": "markdown", "content": "**进行中（含告急）：**"})
         elements.append(_table(
-            [["开发", "款号", "品类", "下单量", "预计交期", "工厂货期"]] + rows
+            [["开发", "款号", "品类", "进度", "下单量", "预计交期", "工厂货期"]] + active_rows
         ))
-        shown_any_progress = True
-
-    # 其他未在预设列表里的进度
-    for prog, rows in progress_buckets.items():
-        if prog in PROGRESS_ORDER or not rows:
-            continue
-        rows.sort(key=lambda x: x[0])
-        elements.append({"tag": "markdown", "content": f"**{prog}（{len(rows)}款）：**"})
-        elements.append(_table(
-            [["开发", "款号", "品类", "下单量", "预计交期", "工厂货期"]] + rows
-        ))
-        shown_any_progress = True
-
-    if not urgent_rows and not shown_any_progress:
+    else:
         elements.append({"tag": "markdown", "content": "当前无进行中的大货订单"})
 
     total_pending = sum(len(d["pending"]) for d in all_data)
     total_forecast = sum(len(d["forecast"]) for d in all_data)
-    total_urgent = len(urgent_rows)
+    total_urgent = sum(len(d["bulk_urgent"]) for d in all_data)
 
     return {
         "schema": "2.0",
@@ -473,12 +455,17 @@ def run_daily_report():
 
     logger.info(f"共识别到 {len(developers)} 位开发人员")
 
+    # 构建历史均值映射（AI预估用）
+    from app.utils.cycle_calc import build_cycle_map
+    cycle_map = build_cycle_map(samples)
+    logger.info(f"历史均值：工厂×品类 {len(cycle_map['factory'])} 组，品类 {len(cycle_map['category'])} 组")
+
     # 统筹汇总数据
     summary_data = []
 
     for dev_name, dev_id in developers.items():
         try:
-            forecast = get_return_forecast(samples, dev_name)
+            forecast = get_return_forecast(samples, dev_name, cycle_map)
             pending, no_info, reserve, cancelled = get_pending_versions(dev_products, dev_name)
             bulk_progress, bulk_urgent = get_bulk_progress(bulk_raw, dev_name)
 
