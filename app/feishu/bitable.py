@@ -274,10 +274,17 @@ def inspect_fields(app_token: str, table_id: str, sample_rows: int = 3) -> dict[
 # ──────────────────────────────────────────────
 
 def _str(fields: dict, key: str) -> str:
-    """普通文本字段"""
+    """
+    普通文本字段。兼容两种返回格式：
+    - 普通 records API：[{"text": "xxx", "type": "text"}]
+    - search API：{"type": 1, "value": [{"text": "xxx", "type": "text"}]}
+    """
     val = fields.get(key)
     if val is None:
         return ""
+    # search API 格式：{"type": 1, "value": [...]}
+    if isinstance(val, dict) and "value" in val:
+        val = val["value"]
     if isinstance(val, list) and val and isinstance(val[0], dict):
         return "".join(item.get("text", "") for item in val)
     return str(val)
@@ -287,9 +294,16 @@ def _str(fields: dict, key: str) -> str:
 def _relation_text(fields: dict, key: str) -> str:
     """
     关联字段，取第一条关联记录的 text 值。
-    格式：[{"text": "ZQZ402", "record_ids": [...], "table_id": "..."}]
+    兼容两种格式：
+    - 普通 records API：[{"text": "ZQZ402", "record_ids": [...]}]
+    - search API：{"type": 1, "value": [{"text": "ZQZ402", ...}]}
     """
     val = fields.get(key)
+    if val is None:
+        return ""
+    # search API 格式
+    if isinstance(val, dict) and "value" in val:
+        val = val["value"]
     if not val or not isinstance(val, list):
         return ""
     first = val[0]
@@ -387,6 +401,135 @@ def _person(fields: dict, key: str) -> tuple[str, str]:
     name = first.get("name") or first.get("enName", "")
     uid = first.get("id", "")
     return name, uid
+
+
+# ──────────────────────────────────────────────
+# 今日回版记录（回版通知专用，只拉今日数据）
+# ──────────────────────────────────────────────
+
+def _search_str(fields: dict, key: str) -> str:
+    """search API 文本字段解析：{"type":1, "value":[{"text":"xxx"}]}"""
+    val = fields.get(key)
+    if val is None:
+        return ""
+    if isinstance(val, dict) and "value" in val:
+        items = val["value"]
+        if isinstance(items, list):
+            return "".join(i.get("text", "") for i in items if isinstance(i, dict))
+    return _str(fields, key)
+
+
+def _search_person(fields: dict, key: str) -> tuple[str, str]:
+    """search API 人员字段解析：{"type":11, "value":[{"name":"xxx","id":"ou_xxx"}]}"""
+    val = fields.get(key)
+    if val is None:
+        return "", ""
+    if isinstance(val, dict) and "value" in val:
+        users = val["value"]
+        if users and isinstance(users[0], dict):
+            first = users[0]
+            return first.get("name", ""), first.get("id", "")
+    return _person(fields, key)
+
+
+def _search_date(fields: dict, key: str) -> Optional[date]:
+    """search API 日期字段解析：{"type":5, "value":1234567890000}"""
+    val = fields.get(key)
+    if val is None:
+        return None
+    if isinstance(val, dict) and "value" in val:
+        val = val["value"]
+    if not val:
+        return None
+    try:
+        return datetime.fromtimestamp(int(val) / 1000).date()
+    except (ValueError, TypeError, OSError):
+        return None
+
+
+def fetch_today_return_samples(
+    app_token: str,
+    table_id: str,
+    dev_product_map: dict[str, tuple[str, str]] | None = None,
+) -> list[SampleRecord]:
+    """
+    只拉取回版日期=今日的样衣记录，用于回版实时通知。
+    使用飞书 search API + Today 关键字过滤，避免拉全表。
+    search API 返回的字段格式与普通 records API 不同，需单独解析。
+    """
+    url = f"{FEISHU_BASE}/bitable/v1/apps/{app_token}/tables/{table_id}/records/search"
+    payload = {
+        "filter": {
+            "conjunction": "and",
+            "conditions": [
+                {
+                    "field_name": "回版日期",
+                    "operator": "is",
+                    "value": ["Today"],
+                }
+            ]
+        },
+        "page_size": 500,
+    }
+
+    try:
+        resp = requests.post(url, headers=get_headers(), json=payload, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as e:
+        logger.error(f"拉取今日回版记录失败: {e}")
+        raise
+
+    if data.get("code") != 0:
+        raise RuntimeError(f"多维表 API 错误: {data.get('msg')} (code={data.get('code')})")
+
+    items = data.get("data", {}).get("items", [])
+    logger.info(f"今日回版记录：{len(items)} 条")
+
+    # 款号关联通过 record_id 查找，需要拿到款号文字
+    # search API 的款号字段只返回 link_record_ids，拿不到文字
+    # 改为：从 dev_product_map 的 record_id 反查款号
+    # 实际上更简单：直接从记录编号里截取款号（记录编号格式：款号-版本，如 ZQZ408-初版）
+    def _extract_style_no(sample_no: str) -> str:
+        """从记录编号提取款号，如 ZQZ408-初版 → ZQZ408"""
+        if not sample_no:
+            return ""
+        # 找最后一个 - 之前的部分（复版的格式：ZSY913-复版2）
+        # 款号本身不含中文，版本描述含中文
+        parts = sample_no.split("-")
+        style_parts = []
+        for p in parts:
+            if any('一' <= c <= '鿿' for c in p):
+                break
+            style_parts.append(p)
+        return "-".join(style_parts) if style_parts else parts[0]
+
+    results = []
+    for item in items:
+        f = item.get("fields", {})
+        try:
+            name, uid = _search_person(f, "开发")
+            sample_no = _search_str(f, "记录编号")
+            style_no = _extract_style_no(sample_no)
+            season, category = ("", "")
+            if dev_product_map and style_no:
+                season, category = dev_product_map.get(style_no, ("", ""))
+            results.append(SampleRecord(
+                auto_id=str(_search_str(f, "自动编号") or _int(f, "自动编号")),
+                sample_no=sample_no,
+                supplier=_search_str(f, "打版工厂"),
+                developer=name,
+                developer_id=uid,
+                product_type=category,
+                season=season,
+                send_date=_search_date(f, "下版日期"),
+                return_date=_search_date(f, "回版日期"),
+                review_date=_search_date(f, "审版日期"),
+            ))
+        except Exception as e:
+            logger.warning(f"跳过异常记录 record_id={item.get('record_id')}: {e}")
+
+    return results
 
 
 # ──────────────────────────────────────────────

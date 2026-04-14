@@ -19,7 +19,7 @@ scheduler = BlockingScheduler(timezone="Asia/Shanghai")
 
 scheduler.add_job(
     run_daily_report,
-    CronTrigger(hour=10, minute=30, timezone="Asia/Shanghai"),
+    CronTrigger(hour=10, minute=0, timezone="Asia/Shanghai"),
     id="daily_report",
     name="每日早报",
     max_instances=1,
@@ -27,7 +27,7 @@ scheduler.add_job(
 )
 
 if __name__ == "__main__":
-    logger.info("开发工作助手启动，每日 10:30 推送早报")
+    logger.info("开发工作助手启动，每日 10:00 推送早报")
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
