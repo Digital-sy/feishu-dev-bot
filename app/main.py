@@ -24,6 +24,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from app.tasks.daily_report import run_daily_report
 from app.tasks.return_alert import run_return_alert
 from app.tasks.pm_report import run_pm_report
+from app.tasks.shop_report import run_shop_report
 from app.feishu.bitable import init_option_map
 from app.feishu.message import send_card
 from app.config import config
@@ -111,6 +112,16 @@ scheduler.add_job(
     misfire_grace_time=300,
 )
 
+# 店长播报：10:00
+scheduler.add_job(
+    run_shop_report,
+    CronTrigger(hour=10, minute=0, timezone="Asia/Shanghai"),
+    id="shop_report",
+    name="店长播报",
+    max_instances=1,
+    misfire_grace_time=300,
+)
+
 # 回版实时通知：每5分钟
 scheduler.add_job(
     run_return_alert,
@@ -140,7 +151,7 @@ scheduler.add_job(
 if __name__ == "__main__":
     init()
     logger.info("开发工作助手启动")
-    logger.info("  每日早报 + 产品经理播报：10:00")
+    logger.info("  每日早报 + 产品经理播报 + 店长播报：10:00")
     logger.info("  回版通知：每5分钟（10:00-22:00）")
     logger.info("  健康检查：11:00")
     try:
