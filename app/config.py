@@ -22,6 +22,7 @@ class Config:
     summary_receiver_id: str     # 统筹汇总接收人 open_id
     table_finalized: str         # 定版明细表
     pm_receiver_ids: list[str]   # 产品经理播报接收人列表
+    shop_manager_ids: dict[str, str]  # 店长播报：{店铺名: open_id}
 
 
 def load_config() -> Config:
@@ -37,6 +38,17 @@ def load_config() -> Config:
     missing = [k for k in required if not os.getenv(k)]
     if missing:
         raise EnvironmentError(f"缺少必要环境变量: {', '.join(missing)}")
+
+    # 解析店长配置：REORIA:ou_xxx,品牌B:ou_yyy
+    shop_manager_ids: dict[str, str] = {}
+    raw = os.getenv("SHOP_MANAGER_IDS", "")
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if ":" in entry:
+            shop, uid = entry.split(":", 1)
+            shop, uid = shop.strip(), uid.strip()
+            if shop and uid:
+                shop_manager_ids[shop] = uid
 
     return Config(
         feishu_app_id=os.environ["FEISHU_APP_ID"],
@@ -60,6 +72,7 @@ def load_config() -> Config:
             s.strip() for s in os.getenv("PM_RECEIVER_IDS", "").split(",")
             if s.strip()
         ],
+        shop_manager_ids=shop_manager_ids,
     )
 
 
