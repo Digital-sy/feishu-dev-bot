@@ -20,6 +20,8 @@ class Config:
     log_level: str
     excluded_seasons: list[str]  # 手动剔除的季节，逗号分隔
     summary_receiver_id: str     # 统筹汇总接收人 open_id
+    table_finalized: str         # 定版明细表
+    pm_receiver_ids: list[str]   # 产品经理播报接收人列表
 
 
 def load_config() -> Config:
@@ -53,6 +55,11 @@ def load_config() -> Config:
             if s.strip()
         ],
         summary_receiver_id=os.getenv("SUMMARY_RECEIVER_ID", ""),
+        table_finalized=os.getenv("TABLE_ID_FINALIZED", ""),
+        pm_receiver_ids=[
+            s.strip() for s in os.getenv("PM_RECEIVER_IDS", "").split(",")
+            if s.strip()
+        ],
     )
 
 

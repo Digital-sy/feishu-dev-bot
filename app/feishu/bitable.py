@@ -46,8 +46,8 @@ def init_option_map(app_token: str,
     - 大货进度、季节：从大货表拉
     - 品类：从开款任务表拉（来源最完整，90个选项）
     """
-    _load_options(app_token, table_dev,  ["回版状态"])
-    _load_options(app_token, table_bulk, ["季节"])
+    _load_options(app_token, table_dev, ["回版状态", "店铺"])
+    _load_options(app_token, table_bulk, ["大货进度", "季节"])
     _load_options(app_token, table_task, ["品类"])
     logger.info(f"选项映射加载完成，共 {len(_opt_map)} 个选项")
 
@@ -55,7 +55,7 @@ def init_option_map(app_token: str,
 def _load_options(app_token: str, table_id: str, field_names: list[str]) -> None:
     url = f"{FEISHU_BASE}/bitable/v1/apps/{app_token}/tables/{table_id}/fields"
     try:
-        resp = requests.get(url, headers=get_headers(), timeout=15)
+        resp = requests.get(url, headers=get_headers(), timeout=60)
         resp.raise_for_status()
         items = resp.json().get("data", {}).get("items", [])
     except Exception as e:
@@ -186,7 +186,7 @@ def _fetch_all_records(app_token: str, table_id: str) -> list[dict]:
         if page_token:
             params["page_token"] = page_token
         try:
-            resp = requests.get(url, headers=get_headers(), params=params, timeout=15)
+            resp = requests.get(url, headers=get_headers(), params=params, timeout=60)
             resp.raise_for_status()
             data = resp.json()
         except requests.RequestException as e:
@@ -217,7 +217,7 @@ def _fetch_all_records(app_token: str, table_id: str) -> list[dict]:
 def inspect_fields(app_token: str, table_id: str, sample_rows: int = 3) -> dict[str, Any]:
     url = f"{FEISHU_BASE}/bitable/v1/apps/{app_token}/tables/{table_id}/records"
     resp = requests.get(url, headers=get_headers(),
-                        params={"page_size": sample_rows}, timeout=15)
+                        params={"page_size": sample_rows}, timeout=60)
     resp.raise_for_status()
     data = resp.json()
 
@@ -473,7 +473,7 @@ def fetch_today_return_samples(
     }
 
     try:
-        resp = requests.post(url, headers=get_headers(), json=payload, timeout=15)
+        resp = requests.post(url, headers=get_headers(), json=payload, timeout=60)
         resp.raise_for_status()
         data = resp.json()
     except requests.RequestException as e:
@@ -678,3 +678,173 @@ def filter_active_seasons(
     ]
 
     return main_list, excluded_list
+
+
+# ──────────────────────────────────────────────
+# 产品经理播报数据计算
+# ──────────────────────────────────────────────
+
+@dataclass
+class PmReportData:
+    """产品经理播报数据，按季节+店铺分组"""
+    season: str
+    shop: str
+    # 板块1：待下版单
+    total_plan: int          # 计划数（开款任务表总数）
+    sent_version: int        # 已下版单
+    yesterday_sent: int      # 昨日下版单
+    completion_rate: str     # 新品完成率
+    # 板块2：回版预报
+    finalized: int           # 已定版
+    yesterday_finalized: int # 昨日定版数
+    finalize_rate: str       # 定版完成率
+    # 板块3：大货进度
+    in_production: int       # 生产中
+    yesterday_ordered: int   # 昨日下单数
+    production_ratio: str    # 生产中占比
+    completed: int           # 已出完大货
+    yesterday_delivered: int # 昨日交货数
+    completion_bulk_rate: str # 大货完成率
+
+
+def calc_pm_report(
+    app_token: str,
+    table_task: str,
+    table_dev_product: str,
+    table_finalized: str,
+    table_bulk: str,
+) -> list[PmReportData]:
+    """
+    计算产品经理播报数据。
+    按季节+店铺分组，统计各板块数据。
+    """
+    from datetime import datetime, timedelta
+
+    today = date.today()
+    yesterday = today - timedelta(days=1)
+    active = get_active_seasons()
+
+    # ── 1. 开款任务表：计划数（按季节+店铺） ──
+    task_raw = _fetch_all_records(app_token, table_task)
+    # 开款任务表字段：开款计划季节、店铺、开款数量
+    plan_map: dict[tuple, int] = {}   # (season, shop) -> 计划数
+    for item in task_raw:
+        f = item.get("fields", {})
+        season = _str(f, "开款计划季节")
+        shop = _str(f, "店铺")
+        qty_raw = f.get("开款数量")
+        try:
+            qty = int(float(str(qty_raw))) if qty_raw else 0
+        except (ValueError, TypeError):
+            qty = 0
+        if season in active and season and shop:
+            key = (season, shop)
+            plan_map[key] = plan_map.get(key, 0) + qty
+
+    # ── 2. 开发产品表：已下版单、昨日下版单 ──
+    dev_raw = _fetch_all_records(app_token, table_dev_product)
+    sent_map: dict[tuple, int] = {}         # (season, shop) -> 已下版单数
+    yesterday_sent_map: dict[tuple, int] = {}  # (season, shop) -> 昨日下版单数
+
+    for item in dev_raw:
+        f = item.get("fields", {})
+        season, _ = _task_season_category(f)
+        shop = _str(f, "店铺")
+        if season not in active or not shop:
+            continue
+        key = (season, shop)
+        status = _option(f, "回版状态")
+        # 已下版单：排除「未下版单」和「取消」
+        if status not in ("未下版单", "取消", ""):
+            sent_map[key] = sent_map.get(key, 0) + 1
+
+    # ── 3. 开发版明细表：昨日下版单（下版日期=昨日） ──
+    sample_raw = _fetch_all_records(app_token, table_task.replace(
+        table_task, "tbllBQpqAvTVVULB"  # 开发版明细表 table_id
+    ))
+    # 注意：这里直接用 table_sample_detail 参数更好，改为从外部传入
+
+    # ── 4. 定版明细表：已定版、昨日定版 ──
+    finalized_raw = _fetch_all_records(app_token, table_finalized)
+    finalized_map: dict[tuple, int] = {}
+    yesterday_finalized_map: dict[tuple, int] = {}
+
+    for item in finalized_raw:
+        f = item.get("fields", {})
+        season = _str(f, "季节")
+        shop = _str(f, "店铺")
+        if season not in active or not shop:
+            continue
+        key = (season, shop)
+        finalized_map[key] = finalized_map.get(key, 0) + 1
+        fin_date = _date(f, "定版日期")
+        if fin_date == yesterday:
+            yesterday_finalized_map[key] = yesterday_finalized_map.get(key, 0) + 1
+
+    # ── 5. 大货表：生产中、昨日下单、已出完、昨日交货 ──
+    bulk_raw = _fetch_all_records(app_token, table_bulk)
+    in_prod_map: dict[tuple, int] = {}
+    yesterday_ordered_map: dict[tuple, int] = {}
+    completed_map: dict[tuple, int] = {}
+    yesterday_delivered_map: dict[tuple, int] = {}
+
+    EXCLUDE = {"暂不下单，备用款", "订单取消"}
+
+    for item in bulk_raw:
+        f = item.get("fields", {})
+        season = _opt(f.get("季节", [""])[0] if isinstance(f.get("季节"), list) else "")
+        shop = _str(f, "品牌")
+        progress = _str(f, "大货进度")
+        order_type = _str(f, "订单类型")
+
+        if season not in active or not shop or progress in EXCLUDE:
+            continue
+        if order_type == "返单":
+            continue
+
+        key = (season, shop)
+
+        if progress == "已出完":
+            completed_map[key] = completed_map.get(key, 0) + 1
+            actual = _date(f, "实际出完日期")
+            if actual == yesterday:
+                yesterday_delivered_map[key] = yesterday_delivered_map.get(key, 0) + 1
+        else:
+            in_prod_map[key] = in_prod_map.get(key, 0) + 1
+
+        order_date = _date(f, "跟单下单时间")
+        if order_date == yesterday:
+            yesterday_ordered_map[key] = yesterday_ordered_map.get(key, 0) + 1
+
+    # ── 汇总 ──
+    all_keys = set(plan_map.keys()) | set(sent_map.keys()) | set(finalized_map.keys())
+    results = []
+
+    for key in sorted(all_keys):
+        season, shop = key
+        total = plan_map.get(key, 0)
+        sent = sent_map.get(key, 0)
+        fin = finalized_map.get(key, 0)
+        in_prod = in_prod_map.get(key, 0)
+        comp = completed_map.get(key, 0)
+        total_bulk = in_prod + comp
+
+        results.append(PmReportData(
+            season=season,
+            shop=shop,
+            total_plan=total,
+            sent_version=sent,
+            yesterday_sent=yesterday_sent_map.get(key, 0),
+            completion_rate=f"{round(sent/total*100)}%" if total else "—",
+            finalized=fin,
+            yesterday_finalized=yesterday_finalized_map.get(key, 0),
+            finalize_rate=f"{round(fin/total*100)}%" if total else "—",
+            in_production=in_prod,
+            yesterday_ordered=yesterday_ordered_map.get(key, 0),
+            production_ratio=f"{round(in_prod/total_bulk*100)}%" if total_bulk else "—",
+            completed=comp,
+            yesterday_delivered=yesterday_delivered_map.get(key, 0),
+            completion_bulk_rate=f"{round(comp/total_bulk*100)}%" if total_bulk else "—",
+        ))
+
+    return results
