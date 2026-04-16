@@ -1,6 +1,7 @@
 """
 产品经理播报。
 每日 10:00 推送，按季节+店铺分组，统计开发进度数据。
+口径：只统计首发款（排除预备款），所有完成率以计划数为分母。
 """
 import logging
 import os
@@ -70,19 +71,31 @@ def calc_pm_data() -> list[PmRow]:
         key = (season, shop)
         plan_map[key] = plan_map.get(key, 0) + qty
 
-    # ── 开发产品表：已下版单 + 建立款号→季节/店铺映射 ──
+    # ── 开发产品表：已下版单 + 建立款号→季节/店铺/上架批次映射 ──
     dev_raw = _fetch_all_records(config.bitable_app_token, config.table_dev_product)
     sent_map: dict[tuple, int] = {}
     dev_season_map: dict[str, str] = {}   # 款号 → 季节
+    dev_launch_map: dict[str, str] = {}   # 款号 → 上架批次（首发款/预备款/空）
     for item in dev_raw:
         f = item.get("fields", {})
         season, _ = _task_season_category(f)
-        shop = _str(f, "店铺")   # 开发产品表店铺是文本字段，直接读
+        shop = _str(f, "店铺")
         product_no = _str(f, "款号")
+        launch_batch = _str(f, "上架批次")
+
+        # 建立款号映射（供大货表和定版明细表关联用）
         if season and product_no:
             dev_season_map[product_no] = season
+        if product_no:
+            dev_launch_map[product_no] = launch_batch
+
         if season not in active or not shop:
             continue
+
+        # ★ 只统计首发款，预备款跳过
+        if launch_batch == "预备款":
+            continue
+
         status = _option(f, "回版状态")
         if status not in ("未下版单", "取消", ""):
             key = (season, shop)
@@ -96,7 +109,6 @@ def calc_pm_data() -> list[PmRow]:
         send_date = _date(f, "下版日期")
         if send_date != yesterday:
             continue
-        # 通过款号关联字段拿款号，再从 dev_season_map 拿季节
         style_val = f.get("款号")
         style_no = ""
         if isinstance(style_val, list) and style_val:
@@ -104,6 +116,11 @@ def calc_pm_data() -> list[PmRow]:
             if isinstance(first, dict):
                 style_no = first.get("text", "")
         season = dev_season_map.get(style_no, "")
+
+        # ★ 只统计首发款
+        if dev_launch_map.get(style_no, "") == "预备款":
+            continue
+
         shop_id = f.get("店铺")
         shop = _opt(shop_id[0]) if isinstance(shop_id, list) and shop_id else ""
         if season not in active or not shop:
@@ -112,22 +129,23 @@ def calc_pm_data() -> list[PmRow]:
         yesterday_sent_map[key] = yesterday_sent_map.get(key, 0) + 1
 
     # ── 定版明细表：已定版、昨日定版 ──
-    # 季节通过款号关联开发产品表获取（定版明细表季节是公式字段，opt无法映射）
     fin_raw = _fetch_all_records(config.bitable_app_token, config.table_finalized)
     finalized_map: dict[tuple, int] = {}
     yesterday_fin_map: dict[tuple, int] = {}
     for item in fin_raw:
         f = item.get("fields", {})
-        # 从款号关联字段提取款号文字
         style_val = f.get("款号")
         style_no = ""
         if isinstance(style_val, list) and style_val:
             first = style_val[0]
             if isinstance(first, dict):
                 style_no = first.get("text", "")
-        # 通过款号从开发产品表映射获取季节
         season = dev_season_map.get(style_no, "")
-        # 店铺通过 opt 映射
+
+        # ★ 只统计首发款
+        if dev_launch_map.get(style_no, "") == "预备款":
+            continue
+
         shop_id = f.get("店铺")
         shop = _opt(shop_id[0]) if isinstance(shop_id, list) and shop_id else ""
         if season not in active or not shop:
@@ -147,7 +165,6 @@ def calc_pm_data() -> list[PmRow]:
 
     for item in bulk_raw:
         f = item.get("fields", {})
-        # 大货表季节通过款号关联开发产品表获取
         style_no = _str(f, "款号")
         season = dev_season_map.get(style_no, "")
         shop_id = f.get("品牌")
@@ -158,6 +175,10 @@ def calc_pm_data() -> list[PmRow]:
         if season not in active or not shop:
             continue
         if progress in EXCLUDE_PROGRESS or order_type == "返单":
+            continue
+
+        # ★ 只统计首发款
+        if dev_launch_map.get(style_no, "") == "预备款":
             continue
 
         key = (season, shop)
@@ -185,7 +206,6 @@ def calc_pm_data() -> list[PmRow]:
         fin = finalized_map.get(key, 0)
         in_prod = in_prod_map.get(key, 0)
         comp = completed_map.get(key, 0)
-        total_bulk = in_prod + comp
 
         rows.append(PmRow(
             season=season, shop=shop,
@@ -198,10 +218,10 @@ def calc_pm_data() -> list[PmRow]:
             finalize_rate=_pct(fin, total),
             in_production=in_prod,
             yesterday_ordered=yesterday_order_map.get(key, 0),
-            production_ratio=_pct(in_prod, total_bulk),
+            production_ratio=_pct(in_prod, total),      # ★ 分母改为计划数
             completed=comp,
             yesterday_delivered=yesterday_delivery_map.get(key, 0),
-            bulk_completion_rate=_pct(comp, total_bulk),
+            bulk_completion_rate=_pct(comp, total),     # ★ 分母改为计划数
         ))
 
     return rows
@@ -279,7 +299,7 @@ def build_pm_card(rows: list[PmRow]) -> dict:
     ]
     if rows3b:
         elements.append(table(
-            ["季节", "店铺", "计划数", "已经完成大货", "昨日交货数", "大货完成率"],
+            ["季节", "店铺", "计划数", "已完成大货", "昨日交货数", "大货完成率"],
             rows3b,
         ))
 
@@ -292,7 +312,7 @@ def build_pm_card(rows: list[PmRow]) -> dict:
         },
         "body": {
             "elements": [
-                {"tag": "markdown", "content": f"以下为当季各店铺开发进度概览。"},
+                {"tag": "markdown", "content": "以下为当季各店铺**首发款**开发进度概览（已排除预备款）。"},
                 {"tag": "hr"},
                 *elements,
             ]
