@@ -185,13 +185,24 @@ def _fetch_all_records(app_token: str, table_id: str) -> list[dict]:
         params = {"page_size": 500}
         if page_token:
             params["page_token"] = page_token
-        try:
-            resp = requests.get(url, headers=get_headers(), params=params, timeout=60)
-            resp.raise_for_status()
-            data = resp.json()
-        except requests.RequestException as e:
-            logger.error(f"拉取多维表失败 table={table_id}: {e}")
-            raise
+        last_err = None
+        for attempt in range(3):
+            try:
+                import time
+                if attempt > 0:
+                    time.sleep(5 * attempt)
+                    logger.warning(f"重试第{attempt}次 table={table_id}")
+                resp = requests.get(url, headers=get_headers(), params=params, timeout=120)
+                resp.raise_for_status()
+                data = resp.json()
+                last_err = None
+                break
+            except requests.RequestException as e:
+                last_err = e
+                logger.warning(f"拉取失败第{attempt+1}次 table={table_id}: {e}")
+        if last_err:
+            logger.error(f"拉取多维表失败 table={table_id}: {last_err}")
+            raise last_err
 
         if data.get("code") != 0:
             raise RuntimeError(
@@ -286,8 +297,8 @@ def _str(fields: dict, key: str) -> str:
     if isinstance(val, dict) and "value" in val:
         val = val["value"]
     if isinstance(val, list) and val and isinstance(val[0], dict):
-        return "".join(item.get("text", "") for item in val)
-    return str(val)
+        return "".join(item.get("text", "") for item in val).strip()
+    return str(val).strip()
 
 
 
@@ -308,7 +319,7 @@ def _relation_text(fields: dict, key: str) -> str:
         return ""
     first = val[0]
     if isinstance(first, dict):
-        return first.get("text", "")
+        return (first.get("text") or "").strip()
     return ""
 
 def _option(fields: dict, key: str) -> str:
